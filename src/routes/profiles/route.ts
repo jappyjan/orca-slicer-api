@@ -16,7 +16,10 @@ import {
   deleteBundle,
 } from "./bundle.service";
 import { AppError } from "../../middleware/error";
-import { getDefaultBundledProfilesPath } from "../slicing/profile-resolver";
+import {
+  getDefaultBundledProfilesPath,
+  resolveProfile,
+} from "../slicing/profile-resolver";
 
 const router = Router();
 
@@ -28,11 +31,23 @@ type BundledFilament = {
   name: string;
   base_id: string | null;
   // Filament-only metadata. Bambuddy uses these to pre-pick a profile per
-  // plate slot in the SliceModal multi-color flow. Bundled BBL profiles
-  // commonly carry `filament_type` on the leaf preset; `filament_colour` is
-  // typically missing on bundled profiles (color is a runtime spool attribute,
-  // not a profile attribute) but populated when present so the consumer can
-  // do exact-match where possible.
+  // plate slot in the SliceModal multi-color flow.
+  //
+  // **`filament_type` is almost never on the leaf preset.** A concrete BBL
+  // filament profile is a thin per-printer delta — `Bambu PLA Basic @BBL X1C`
+  // is little more than `{name, inherits, filament_...tweaks}` — and the
+  // material is declared once, further up the `inherits:` chain, on a shared
+  // base such as `Bambu PLA Basic @base` or `fdm_filament_pla`. Reading only
+  // the leaf therefore returned `null` for essentially the whole tier, which
+  // is what made Bambuddy's filament auto-pick material-blind: with no type on
+  // any candidate its type-match score never fired and an ABS plate happily
+  // pre-picked TPU (bambuddy#47). Both fields are resolved through the
+  // inheritance walk.
+  //
+  // `filament_colour` is genuinely absent from most bundled profiles — colour
+  // is a runtime spool attribute, not a profile attribute — and is populated
+  // only where the tree really states one, so the consumer can exact-match
+  // when possible without being handed a fabricated value.
   filament_type: string | null;
   filament_colour: string | null;
 };
@@ -63,11 +78,11 @@ router.get("/bundled", async (_req, res) => {
   }
 
   const result: BundledIndex = {
-    printer: await readBundledDir(path.join(bundledPath, "machine"), false),
-    process: await readBundledDir(path.join(bundledPath, "process"), false),
+    printer: await readBundledDir(path.join(bundledPath, "machine"), null),
+    process: await readBundledDir(path.join(bundledPath, "process"), null),
     filament: (await readBundledDir(
       path.join(bundledPath, "filament"),
-      true,
+      bundledPath,
     )) as BundledFilament[],
   };
   bundledIndexCache = result;
@@ -75,9 +90,16 @@ router.get("/bundled", async (_req, res) => {
   res.status(200).json(result);
 });
 
+/**
+ * List one bundled category.
+ *
+ * `bundledProfilesPath` is non-null only for the filament directory, where it
+ * is the root the `inherits:` walk resolves parents against. Printer and
+ * process listings need no metadata, so they never pay for the walk.
+ */
 async function readBundledDir(
   dir: string,
-  includeFilamentMetadata: boolean,
+  bundledProfilesPath: string | null,
 ): Promise<({ name: string; base_id: string | null } | BundledFilament)[]> {
   if (!fs.existsSync(dir)) return [];
   let entries: string[];
@@ -98,6 +120,7 @@ async function readBundledDir(
         instantiation?: string;
         filament_type?: string | string[];
         filament_colour?: string | string[];
+        default_filament_colour?: string | string[];
       };
       // Bundled profiles ship a mix of concrete presets and abstract bases
       // (e.g. `fdm_filament_pla`). Skip the latter so the slicer modal only
@@ -106,11 +129,10 @@ async function readBundledDir(
       if (json.instantiation && json.instantiation !== "true") continue;
       if (!json.name) continue;
       const base = { name: json.name, base_id: json.inherits ?? null };
-      if (includeFilamentMetadata) {
+      if (bundledProfilesPath) {
         out.push({
           ...base,
-          filament_type: firstScalar(json.filament_type),
-          filament_colour: firstScalar(json.filament_colour),
+          ...(await filamentMetadata(json, bundledProfilesPath)),
         });
       } else {
         out.push(base);
@@ -126,13 +148,78 @@ async function readBundledDir(
   return out;
 }
 
+type RawFilamentFields = {
+  inherits?: string;
+  filament_type?: string | string[];
+  filament_colour?: string | string[];
+  default_filament_colour?: string | string[];
+};
+
+/**
+ * `filament_type` / `filament_colour` for one leaf preset, following
+ * `inherits:` when the leaf does not state them itself.
+ *
+ * The walk is `resolveProfile` — the same flattener `/resolved-process` and
+ * the slice path already use — rather than a second, subtly different one. It
+ * only runs when the leaf is missing something, which on the BBL tree is the
+ * common case for `filament_type` and the near-universal case for colour, but
+ * the whole listing sits behind a 1-hour cache either way.
+ *
+ * A profile whose chain cannot be resolved (dangling parent, malformed
+ * ancestor, cyclic inherits hitting the depth cap) degrades to whatever the
+ * leaf itself stated. Reporting `null` for one preset costs Bambuddy a match;
+ * failing the request would cost it the entire Standard tier.
+ */
+async function filamentMetadata(
+  leaf: RawFilamentFields,
+  bundledProfilesPath: string,
+): Promise<{ filament_type: string | null; filament_colour: string | null }> {
+  let fields: RawFilamentFields = leaf;
+  const needsWalk =
+    typeof leaf.inherits === "string" &&
+    leaf.inherits.length > 0 &&
+    (firstScalar(leaf.filament_type) === null || colourOf(leaf) === null);
+  if (needsWalk) {
+    try {
+      fields = (await resolveProfile({ ...leaf }, "filament", {
+        bundledProfilesPath,
+      })) as RawFilamentFields;
+    } catch {
+      fields = leaf;
+    }
+  }
+  return {
+    filament_type: firstScalar(fields.filament_type),
+    filament_colour: colourOf(fields),
+  };
+}
+
+/**
+ * The two spellings the bundled trees actually use.
+ *
+ * `filament_colour` is the runtime/per-spool field and is what a user-exported
+ * preset carries; the bundled BBL profiles that state a colour at all use
+ * `default_filament_colour` (which is also the key Bambuddy's own local-preset
+ * importer reads). The two slicers do not agree on which appears where, so
+ * both are accepted, in that order of specificity.
+ */
+function colourOf(fields: RawFilamentFields): string | null {
+  return (
+    firstScalar(fields.filament_colour) ??
+    firstScalar(fields.default_filament_colour)
+  );
+}
+
 function firstScalar(value: string | string[] | undefined): string | null {
   // OrcaSlicer stores per-extruder fields like `filament_type` as arrays
   // (e.g. `["PLA"]` for single-extruder, `["PLA", "PETG"]` for bi-material).
   // For pre-pick matching the first slot is what matters; the caller already
   // knows which slot it's matching to and a per-slot value isn't meaningful
   // on a bundled profile that hasn't been bound to a specific extruder yet.
-  if (Array.isArray(value)) return value[0] ?? null;
+  if (Array.isArray(value)) {
+    const first = value[0];
+    return typeof first === "string" && first.length > 0 ? first : null;
+  }
   if (typeof value === "string" && value.length > 0) return value;
   return null;
 }
