@@ -47,19 +47,16 @@ export async function resolveProfile(
     }
 
     const parentName = current.inherits;
-    const parentPath = path.join(
+    const found = await readParentProfile(
       options.bundledProfilesPath,
       category,
-      `${parentName}.json`,
+      parentName,
     );
-
-    let parentRaw: string;
-    try {
-      parentRaw = await fs.readFile(parentPath, "utf-8");
-    } catch {
+    if (!found) {
       delete current.inherits;
       break;
     }
+    const { filePath: parentPath, raw: parentRaw } = found;
 
     let parent: ProfileJson;
     try {
@@ -94,6 +91,144 @@ export async function resolveProfile(
   }
 
   return current;
+}
+
+/**
+ * Locate and read the bundled file an `inherits:` value names.
+ *
+ * Two things make this more than a `path.join`:
+ *
+ * 1. **A profile's declared `name` is not always its file basename.** Some
+ *    bundled profiles carry a literal `/` in `name` / `inherits` while the
+ *    file on disk sanitizes it — and the two slicers do not agree on the
+ *    replacement character:
+ *
+ *      inherits "Bambu Support For PA/PET @base"  -> "Bambu Support For PA PET @base.json"
+ *      inherits "Bambu Support For PLA/PETG @base" -> "Bambu Support For PLA-PETG @base.json"
+ *
+ *    Deriving the path from the name treats the `/` as a directory
+ *    separator, the read ENOENTs, and the whole remaining ancestor chain is
+ *    dropped silently — so a preset inheriting such a base sliced
+ *    under-specified. Because the sanitization scheme is undocumented and
+ *    demonstrably inconsistent, we do not guess at it: we index the
+ *    directory by each file's *declared* `name` and look the parent up
+ *    there.
+ *
+ * 2. **`inherits` is attacker-shaped input** on the user-upload paths. A
+ *    `..` segment in it reached outside the profiles directory by the same
+ *    path-derivation mechanism. The direct lookup is now refused for any
+ *    value that is not a plain basename, so nothing outside the category
+ *    directory is reachable; the index only ever contains files enumerated
+ *    from inside it.
+ *
+ * Ordering is deliberate: the direct read is tried **first** and the index
+ * is built lazily only when it misses. `resolveProfile` runs once per preset
+ * in a ~2500-file listing loop and the file basename matches the declared
+ * name for the overwhelming majority, so the hot path stays exactly one
+ * `readFile` — no directory enumeration, no behavioural change, no
+ * regression to the cold-listing latency. The index cost is paid only for
+ * the rare slash-named case, and only once per directory.
+ *
+ * Returns `null` when the parent cannot be located; callers preserve the
+ * existing "drop `inherits` and stop walking" behaviour for that case.
+ */
+async function readParentProfile(
+  bundledProfilesPath: string,
+  category: ProfileCategory,
+  parentName: string,
+): Promise<{ filePath: string; raw: string } | null> {
+  const dir = path.join(bundledProfilesPath, category);
+
+  if (isPlainBasename(parentName)) {
+    const direct = path.join(dir, `${parentName}.json`);
+    try {
+      return { filePath: direct, raw: await fs.readFile(direct, "utf-8") };
+    } catch {
+      // Fall through: the name may be declared by a file whose basename was
+      // sanitized, or it may simply be dangling.
+    }
+  }
+
+  const indexed = (await getNameIndex(dir)).get(parentName);
+  if (indexed === undefined) return null;
+  try {
+    return { filePath: indexed, raw: await fs.readFile(indexed, "utf-8") };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * True when `name` can safely be used as a file basename inside the category
+ * directory — i.e. it cannot escape it. Anything with a path separator (a
+ * slash-bearing profile name included) is refused here and resolved through
+ * the index instead, which is exactly right: the index cannot name a file
+ * the directory listing did not produce.
+ */
+function isPlainBasename(name: string): boolean {
+  return (
+    name.length > 0 &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0") &&
+    name !== "." &&
+    name !== ".." &&
+    !path.isAbsolute(name)
+  );
+}
+
+type NameIndex = Map<string, string>;
+
+// Keyed by the category directory, which already encodes
+// (bundledProfilesPath, category). The bundled tree lives in the slicer's
+// read-only `resources/profiles/` and only changes when the container image
+// is rebuilt, so a process-lifetime cache is safe — and necessary: rebuilding
+// per `resolveProfile` call would make the bundled listing O(n^2) in the
+// number of profiles.
+const nameIndexCache = new Map<string, Promise<NameIndex>>();
+
+/** Test seam: drop the memoised directory indexes. */
+export function resetProfileNameIndexCache(): void {
+  nameIndexCache.clear();
+}
+
+async function getNameIndex(dir: string): Promise<NameIndex> {
+  const cached = nameIndexCache.get(dir);
+  if (cached) return cached;
+  const building = buildNameIndex(dir);
+  nameIndexCache.set(dir, building);
+  try {
+    return await building;
+  } catch {
+    // A transient FS failure must not poison the cache for the process
+    // lifetime; an absent directory simply resolves nothing, as before.
+    nameIndexCache.delete(dir);
+    return new Map();
+  }
+}
+
+async function buildNameIndex(dir: string): Promise<NameIndex> {
+  const index: NameIndex = new Map();
+  const entries = await fs.readdir(dir);
+  for (const entry of entries) {
+    if (!entry.endsWith(".json")) continue;
+    const filePath = path.join(dir, entry);
+    let declared: unknown;
+    try {
+      const raw = await fs.readFile(filePath, "utf-8");
+      declared = (JSON.parse(raw) as ProfileJson).name;
+    } catch {
+      // Unreadable or malformed bundled file: not indexable. It stays
+      // reachable by basename via the direct path, where a JSON error is
+      // still reported rather than swallowed.
+      continue;
+    }
+    if (typeof declared !== "string" || declared.length === 0) continue;
+    // First writer wins, so a duplicate declared name resolves
+    // deterministically (readdir order) rather than depending on call order.
+    if (!index.has(declared)) index.set(declared, filePath);
+  }
+  return index;
 }
 
 /**
