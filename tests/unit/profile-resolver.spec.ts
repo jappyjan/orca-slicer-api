@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { promises as fs } from "fs";
 import * as os from "os";
 import * as path from "path";
@@ -7,6 +7,7 @@ import {
   mergeProfiles,
   normalizeFromField,
   resolveProfile,
+  resetProfileNameIndexCache,
   getDefaultBundledProfilesPath,
   type ProfileJson,
 } from "../../src/routes/slicing/profile-resolver";
@@ -278,6 +279,212 @@ describe("resolveProfile", () => {
     await expect(
       resolveProfile(input, "machine", { bundledProfilesPath, maxDepth: 4 }),
     ).rejects.toThrow(/exceeded maximum depth/i);
+  });
+});
+
+/**
+ * A bundled profile's declared `name` is not always its file basename, and
+ * `inherits` is user-controlled on the upload paths. Both facts break a
+ * resolver that derives the parent's path from the `inherits` string.
+ */
+describe("resolveProfile — parent lookup by declared name", () => {
+  let bundledProfilesPath: string;
+  let filamentDir: string;
+
+  const write = (dir: string, file: string, json: Record<string, unknown>) =>
+    fs.writeFile(path.join(dir, `${file}.json`), JSON.stringify(json), "utf8");
+
+  beforeAll(async () => {
+    bundledProfilesPath = await fs.mkdtemp(
+      path.join(os.tmpdir(), "test-inherits-index-"),
+    );
+    filamentDir = path.join(bundledProfilesPath, "filament");
+    await fs.mkdir(filamentDir, { recursive: true });
+    await fs.mkdir(path.join(bundledProfilesPath, "machine"), {
+      recursive: true,
+    });
+
+    // --- Observed sanitization #1: "/" -> " " ------------------------------
+    // inherits value : "Bambu Support For PA/PET @base"
+    // file on disk   : "Bambu Support For PA PET @base.json"
+    await write(filamentDir, "fdm_filament_pa", {
+      name: "fdm_filament_pa",
+      filament_type: ["PA-CF"],
+      filament_vendor: ["Bambu Lab"],
+    });
+    await write(filamentDir, "Bambu Support For PA PET @base", {
+      name: "Bambu Support For PA/PET @base",
+      inherits: "fdm_filament_pa",
+      default_filament_colour: ["#FFFFFF"],
+    });
+
+    // --- Observed sanitization #2: "/" -> "-" ------------------------------
+    // The replacement character differs from case #1, which is exactly why
+    // re-deriving a path from the name is the wrong approach.
+    await write(filamentDir, "fdm_filament_pla", {
+      name: "fdm_filament_pla",
+      filament_type: ["PLA"],
+    });
+    await write(filamentDir, "Bambu Support For PLA-PETG @base", {
+      name: "Bambu Support For PLA/PETG @base",
+      inherits: "fdm_filament_pla",
+    });
+
+    // A file whose basename and declared name agree — the overwhelmingly
+    // common case, and the one the direct-path fast lane must keep serving.
+    await write(filamentDir, "Bambu PLA Basic @base", {
+      name: "Bambu PLA Basic @base",
+      filament_type: ["PLA"],
+    });
+
+    // The traversal target: a real, readable file OUTSIDE the filament
+    // directory that a `..` in `inherits` used to reach.
+    await write(path.join(bundledProfilesPath, "machine"), "secret", {
+      name: "secret",
+      exfiltrated: "yes",
+    });
+
+    resetProfileNameIndexCache();
+  });
+
+  afterAll(async () => {
+    resetProfileNameIndexCache();
+    await fs.rm(bundledProfilesPath, { recursive: true, force: true });
+  });
+
+  it("resolves a slash-bearing parent whose file substitutes a space", async () => {
+    const leaf: ProfileJson = {
+      type: "filament",
+      name: "Bambu Support For PA/PET @BBL X1C",
+      inherits: "Bambu Support For PA/PET @base",
+    };
+    const result = await resolveProfile(leaf, "filament", {
+      bundledProfilesPath,
+    });
+    // Resolved through the slash-named base AND on to its own ancestor.
+    expect(result.filament_type).toEqual(["PA-CF"]);
+    expect(result.filament_vendor).toEqual(["Bambu Lab"]);
+    expect(result.default_filament_colour).toEqual(["#FFFFFF"]);
+    expect(result.inherits).toBeUndefined();
+    expect(result.name).toBe("Bambu Support For PA/PET @BBL X1C");
+  });
+
+  it("resolves a slash-bearing parent whose file substitutes a hyphen", async () => {
+    const leaf: ProfileJson = {
+      type: "filament",
+      name: "Bambu Support For PLA/PETG @BBL X1C",
+      inherits: "Bambu Support For PLA/PETG @base",
+    };
+    const result = await resolveProfile(leaf, "filament", {
+      bundledProfilesPath,
+    });
+    expect(result.filament_type).toEqual(["PLA"]);
+    expect(result.inherits).toBeUndefined();
+  });
+
+  it("still resolves parents whose basename matches their declared name", async () => {
+    const leaf: ProfileJson = {
+      type: "filament",
+      inherits: "Bambu PLA Basic @base",
+    };
+    const result = await resolveProfile(leaf, "filament", {
+      bundledProfilesPath,
+    });
+    expect(result.filament_type).toEqual(["PLA"]);
+  });
+
+  it("does not read outside the category directory via a '..' inherits", async () => {
+    // Sanity-check the fixture: the file the traversal aims at really exists
+    // and really is readable, so a passing assertion below means the lookup
+    // refused it rather than the file merely being absent.
+    await expect(
+      fs.readFile(
+        path.join(bundledProfilesPath, "machine", "secret.json"),
+        "utf-8",
+      ),
+    ).resolves.toContain("exfiltrated");
+
+    const readSpy = vi.spyOn(fs, "readFile");
+    try {
+      const leaf: ProfileJson = {
+        type: "filament",
+        name: "evil",
+        inherits: "../machine/secret",
+      };
+      const result = await resolveProfile(leaf, "filament", {
+        bundledProfilesPath,
+      });
+      // Nothing from outside the filament directory leaked in, and the
+      // unresolvable parent was dropped exactly like any dangling one.
+      expect(result.exfiltrated).toBeUndefined();
+      expect(result.inherits).toBeUndefined();
+      // And the escaping path was never even opened.
+      const opened = readSpy.mock.calls.map((c) => String(c[0]));
+      expect(opened.some((p) => p.includes("secret.json"))).toBe(false);
+    } finally {
+      readSpy.mockRestore();
+    }
+  });
+
+  it("does not read outside the category directory via an absolute inherits", async () => {
+    const absolute = path.join(bundledProfilesPath, "machine", "secret");
+    const result = await resolveProfile(
+      { type: "filament", inherits: absolute },
+      "filament",
+      { bundledProfilesPath },
+    );
+    expect(result.exfiltrated).toBeUndefined();
+    expect(result.inherits).toBeUndefined();
+  });
+
+  it("builds the directory index at most once across many resolutions", async () => {
+    // The listing loop calls resolveProfile once per preset (~2500 files).
+    // Re-enumerating the directory per call would be O(n^2); this pins the
+    // memoisation that prevents it.
+    resetProfileNameIndexCache();
+    const readdirSpy = vi.spyOn(fs, "readdir");
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        await resolveProfile(
+          { type: "filament", inherits: "Bambu Support For PA/PET @base" },
+          "filament",
+          { bundledProfilesPath },
+        );
+      }
+      expect(readdirSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  it("does not enumerate the directory when the direct path hits", async () => {
+    resetProfileNameIndexCache();
+    const readdirSpy = vi.spyOn(fs, "readdir");
+    try {
+      await resolveProfile(
+        { type: "filament", inherits: "Bambu PLA Basic @base" },
+        "filament",
+        { bundledProfilesPath },
+      );
+      expect(readdirSpy).not.toHaveBeenCalled();
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  it("still drops a genuinely dangling inherits after the index misses", async () => {
+    resetProfileNameIndexCache();
+    const result = await resolveProfile(
+      {
+        type: "filament",
+        name: "orphan",
+        inherits: "No Such/Base @base",
+      },
+      "filament",
+      { bundledProfilesPath },
+    );
+    expect(result.inherits).toBeUndefined();
+    expect(result.name).toBe("orphan");
   });
 });
 

@@ -50,6 +50,11 @@ type BundledFilament = {
   // when possible without being handed a fabricated value.
   filament_type: string | null;
   filament_colour: string | null;
+  // Also one hop up the same chain: `filament_vendor` sits on the family
+  // base (`Bambu ABS @base` -> `["Bambu Lab"]`) in both slicers, never on
+  // the per-printer leaf. It comes free with the walk we already do, and
+  // lets Bambuddy group/filter the Standard tier by brand.
+  filament_vendor: string | null;
 };
 type BundledIndex = {
   printer: { name: string; base_id: string | null }[];
@@ -85,6 +90,18 @@ router.get("/bundled", async (_req, res) => {
       bundledPath,
     )) as BundledFilament[],
   };
+  // Resolution counts, once per cache fill. The per-preset degrade paths warn
+  // when the walk *throws*, but the commonest silent failure mode — a
+  // dangling `inherits` that resolves to nothing, which by design neither
+  // throws nor warns — shows up only as fields quietly going `null` across
+  // the tier. This line is what makes that regression self-diagnosing.
+  const resolved = (key: keyof BundledFilament) =>
+    result.filament.filter((f) => f[key] !== null).length;
+  console.info(
+    `[profiles/bundled] listing built: ${result.printer.length} printer, ${result.process.length} process, ${result.filament.length} filament ` +
+      `(filament_type ${resolved("filament_type")}, filament_vendor ${resolved("filament_vendor")}, filament_colour ${resolved("filament_colour")} resolved)`,
+  );
+
   bundledIndexCache = result;
   bundledIndexCachedAt = now;
   res.status(200).json(result);
@@ -114,13 +131,8 @@ async function readBundledDir(
     const filePath = path.join(dir, entry);
     try {
       const raw = await fs.promises.readFile(filePath, "utf8");
-      const json = JSON.parse(raw) as {
-        name?: string;
-        inherits?: string;
+      const json = JSON.parse(raw) as RawFilamentFields & {
         instantiation?: string;
-        filament_type?: string | string[];
-        filament_colour?: string | string[];
-        default_filament_colour?: string | string[];
       };
       // Bundled profiles ship a mix of concrete presets and abstract bases
       // (e.g. `fdm_filament_pla`). Skip the latter so the slicer modal only
@@ -137,9 +149,13 @@ async function readBundledDir(
       } else {
         out.push(base);
       }
-    } catch {
+    } catch (err) {
       // Corrupted / unreadable individual file — skip without breaking the
-      // rest of the listing.
+      // rest of the listing, but say so: a systematic read failure would
+      // otherwise present as a silently empty (or short) listing.
+      console.warn(
+        `[profiles/bundled] skipping unreadable bundled profile ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
       continue;
     }
   }
@@ -149,10 +165,14 @@ async function readBundledDir(
 }
 
 type RawFilamentFields = {
+  name?: string;
   inherits?: string;
   filament_type?: string | string[];
   filament_colour?: string | string[];
   default_filament_colour?: string | string[];
+  // Only one spelling exists for this one — unlike colour, there is no
+  // `default_filament_vendor` in either bundled tree. Do not invent one.
+  filament_vendor?: string | string[];
 };
 
 /**
@@ -173,24 +193,39 @@ type RawFilamentFields = {
 async function filamentMetadata(
   leaf: RawFilamentFields,
   bundledProfilesPath: string,
-): Promise<{ filament_type: string | null; filament_colour: string | null }> {
+): Promise<{
+  filament_type: string | null;
+  filament_colour: string | null;
+  filament_vendor: string | null;
+}> {
   let fields: RawFilamentFields = leaf;
   const needsWalk =
     typeof leaf.inherits === "string" &&
     leaf.inherits.length > 0 &&
-    (firstScalar(leaf.filament_type) === null || colourOf(leaf) === null);
+    (firstScalar(leaf.filament_type) === null ||
+      colourOf(leaf) === null ||
+      firstScalar(leaf.filament_vendor) === null);
   if (needsWalk) {
     try {
       fields = (await resolveProfile({ ...leaf }, "filament", {
         bundledProfilesPath,
       })) as RawFilamentFields;
-    } catch {
+    } catch (err) {
+      // Degrading to leaf-only metadata is deliberate (one preset loses a
+      // match; failing would cost the caller the whole Standard tier) — but
+      // it must not be *silent*. If resolution ever breaks systematically
+      // this endpoint would otherwise go back to answering all-`null` with
+      // no trace of why.
+      console.warn(
+        `[profiles/bundled] inherits walk failed for filament preset "${leaf.name ?? "<unnamed>"}" (inherits="${leaf.inherits}"); falling back to leaf-only metadata: ${err instanceof Error ? err.message : String(err)}`,
+      );
       fields = leaf;
     }
   }
   return {
     filament_type: firstScalar(fields.filament_type),
     filament_colour: colourOf(fields),
+    filament_vendor: firstScalar(fields.filament_vendor),
   };
 }
 
