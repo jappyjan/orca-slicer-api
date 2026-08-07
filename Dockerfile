@@ -1,6 +1,12 @@
 FROM node:22-bookworm AS build
 
-ARG ORCA_VERSION=2.3.2
+# 2.4.2 (2026-07-07), not 2.3.2. OrcaSlicer 2.3.2's CLI nullptr-derefs
+# whenever a BBL machine profile with `different_extruder=true` (a multi-entry
+# `extruder_variant_list`) reaches `--load-settings`, which is every Bambu
+# printer except the A1 / A1 mini — X1C, X1, P1P, P1S, P2S, H2D and H2S all
+# return SIGSEGV. Guarded upstream by SoftFever/OrcaSlicer#13193 (merged
+# 2026-04-16), which is absent from v2.3.2 and present from v2.4.0 on.
+ARG ORCA_VERSION=2.4.2
 ARG TARGETARCH
 
 WORKDIR /app

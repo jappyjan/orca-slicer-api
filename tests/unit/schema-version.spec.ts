@@ -4,7 +4,7 @@ import { parseSlicerVersion } from "../../src/routes/schema/schema.service";
 // Real first lines of `--help` from both images. BambuStudio prefixes its
 // output with boost trace lines, which is the whole reason this isn't a
 // startsWith check.
-const ORCA_HELP = `OrcaSlicer-2.3.2:
+const ORCA_HELP = `OrcaSlicer-2.4.2:
 Usage: orca-slicer [ OPTIONS ] [ file.3mf/file.stl ... ]`;
 
 const BAMBU_HELP = `[2026-07-31 20:57:01.505970] [0x00007ffff183c500] [trace]   Initializing StaticPrintConfigs
@@ -15,7 +15,7 @@ describe("parseSlicerVersion", () => {
   it("reads the OrcaSlicer version", () => {
     expect(parseSlicerVersion(ORCA_HELP)).toEqual({
       slicer: "OrcaSlicer",
-      version: "2.3.2",
+      version: "2.4.2",
     });
   });
 

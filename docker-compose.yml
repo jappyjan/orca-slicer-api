@@ -26,17 +26,24 @@ services:
     # ghcr.io/afkfelix/orca-slicer-api:latest-orca2.3.1 cannot slice real
     # OrcaSlicer GUI exports without these fixes.
     #
+    # The default tracks the Dockerfile's `ARG ORCA_VERSION` — keep the two in
+    # step, because the value set here *overrides* the Dockerfile default, so a
+    # stale pin here silently rebuilds the old slicer.
+    #
     # Note (mid-2026): OrcaSlicer 2.3.2 / 2.4.0-dev have known CLI bugs
     # that block slicing many Bambu-authored 3MFs — see upstream
     # SoftFever/OrcaSlicer#12426 (segfault on painted multi-extruder
     # files) and #13386 (parameter-range strict-validation reject).
     # Bambu Studio is recommended (the bambu-studio-api service below
     # is a drop-in replacement) until the upstream fixes land.
+    # 2.4.2 fixes a *different* segfault (#13193, multi-variant
+    # `extruder_variant_list` via `--load-settings`); whether it also clears
+    # #12426 and #13386 has not been measured.
     build:
       context: .
       args:
-        ORCA_VERSION: "${ORCA_VERSION:-2.3.2}"
-    image: orca-slicer-api:resolver-orca${ORCA_VERSION:-2.3.2}
+        ORCA_VERSION: "${ORCA_VERSION:-2.4.2}"
+    image: orca-slicer-api:resolver-orca${ORCA_VERSION:-2.4.2}
     container_name: orca-slicer-api
     restart: unless-stopped
     ports:
