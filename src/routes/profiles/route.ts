@@ -19,6 +19,7 @@ import { AppError } from "../../middleware/error";
 import {
   getDefaultBundledProfilesPath,
   resolveProfile,
+  type ProfileCategory,
 } from "../slicing/profile-resolver";
 
 const router = Router();
@@ -56,9 +57,34 @@ type BundledFilament = {
   // lets Bambuddy group/filter the Standard tier by brand.
   filament_vendor: string | null;
 };
+type BundledBase = { name: string; base_id: string | null };
+type BundledPrinter = BundledBase & {
+  // The printer's bed outline, as the polygon the profile tree declares:
+  // a list of `"<x>x<y>"` corner points in bed millimetres, e.g.
+  // `["0x0","256x0","256x256","0x256"]`. **Not** a width/height pair.
+  //
+  // Like `filament_type`, it is almost never on the leaf. A concrete BBL
+  // machine preset is a per-nozzle delta (`Bambu Lab H2D 0.4 nozzle`), and
+  // the bed is declared once on a shared base such as
+  // `fdm_bbl_3dp_002_common`. Measured against both bundled trees, the leaf
+  // states it for 4/44 presets in OrcaSlicer v2.3.2 and 7/56 in BambuStudio
+  // v02.07.01.57 — everything else sits one or two levels up the `inherits:`
+  // chain. Reading only the leaf would report `null` for ~90% of the tier.
+  //
+  // **Emitted raw, deliberately.** Reducing it here to `{width, height}`
+  // would silently flatten the shapes that are not axis-aligned rectangles
+  // anchored at the origin, and those exist: across OrcaSlicer's full vendor
+  // tree, 582 profiles declare a 4-point outline but 8 declare 72 points
+  // (round delta beds), 3 declare 6 and 3 declare 239. The consumer knows
+  // what it needs — a bounding box, a render outline — and can decide.
+  //
+  // `null` means the whole chain stated nothing usable. It is NOT "a bed of
+  // size zero", and consumers must keep the two apart.
+  printable_area: string[] | null;
+};
 type BundledIndex = {
-  printer: { name: string; base_id: string | null }[];
-  process: { name: string; base_id: string | null }[];
+  printer: BundledPrinter[];
+  process: BundledBase[];
   filament: BundledFilament[];
 };
 let bundledIndexCache: BundledIndex | null = null;
@@ -83,10 +109,19 @@ router.get("/bundled", async (_req, res) => {
   }
 
   const result: BundledIndex = {
-    printer: await readBundledDir(path.join(bundledPath, "machine"), null),
-    process: await readBundledDir(path.join(bundledPath, "process"), null),
+    printer: (await readBundledDir(
+      path.join(bundledPath, "machine"),
+      "machine",
+      bundledPath,
+    )) as BundledPrinter[],
+    process: await readBundledDir(
+      path.join(bundledPath, "process"),
+      "process",
+      null,
+    ),
     filament: (await readBundledDir(
       path.join(bundledPath, "filament"),
+      "filament",
       bundledPath,
     )) as BundledFilament[],
   };
@@ -97,9 +132,10 @@ router.get("/bundled", async (_req, res) => {
   // the tier. This line is what makes that regression self-diagnosing.
   const resolved = (key: keyof BundledFilament) =>
     result.filament.filter((f) => f[key] !== null).length;
+  const beds = result.printer.filter((p) => p.printable_area !== null).length;
   console.info(
     `[profiles/bundled] listing built: ${result.printer.length} printer, ${result.process.length} process, ${result.filament.length} filament ` +
-      `(filament_type ${resolved("filament_type")}, filament_vendor ${resolved("filament_vendor")}, filament_colour ${resolved("filament_colour")} resolved)`,
+      `(printable_area ${beds}, filament_type ${resolved("filament_type")}, filament_vendor ${resolved("filament_vendor")}, filament_colour ${resolved("filament_colour")} resolved)`,
   );
 
   bundledIndexCache = result;
@@ -110,14 +146,17 @@ router.get("/bundled", async (_req, res) => {
 /**
  * List one bundled category.
  *
- * `bundledProfilesPath` is non-null only for the filament directory, where it
- * is the root the `inherits:` walk resolves parents against. Printer and
- * process listings need no metadata, so they never pay for the walk.
+ * `bundledProfilesPath` is non-null for the categories that carry resolved
+ * metadata — filament (`filament_type` / `filament_colour` / `filament_vendor`)
+ * and machine (`printable_area`) — and is the root the `inherits:` walk
+ * resolves parents against. The process listing needs no metadata, so it never
+ * pays for the walk.
  */
 async function readBundledDir(
   dir: string,
+  category: ProfileCategory,
   bundledProfilesPath: string | null,
-): Promise<({ name: string; base_id: string | null } | BundledFilament)[]> {
+): Promise<(BundledBase | BundledPrinter | BundledFilament)[]> {
   if (!fs.existsSync(dir)) return [];
   let entries: string[];
   try {
@@ -125,26 +164,32 @@ async function readBundledDir(
   } catch {
     return [];
   }
-  const out: ({ name: string; base_id: string | null } | BundledFilament)[] = [];
+  const out: (BundledBase | BundledPrinter | BundledFilament)[] = [];
   for (const entry of entries) {
     if (!entry.endsWith(".json")) continue;
     const filePath = path.join(dir, entry);
     try {
       const raw = await fs.promises.readFile(filePath, "utf8");
-      const json = JSON.parse(raw) as RawFilamentFields & {
-        instantiation?: string;
-      };
+      const json = JSON.parse(raw) as RawFilamentFields &
+        RawPrinterFields & {
+          instantiation?: string;
+        };
       // Bundled profiles ship a mix of concrete presets and abstract bases
       // (e.g. `fdm_filament_pla`). Skip the latter so the slicer modal only
       // offers things a user can actually pick. `instantiation:"true"` is the
       // BBL convention for "this is a leaf preset".
       if (json.instantiation && json.instantiation !== "true") continue;
       if (!json.name) continue;
-      const base = { name: json.name, base_id: json.inherits ?? null };
-      if (bundledProfilesPath) {
+      const base: BundledBase = { name: json.name, base_id: json.inherits ?? null };
+      if (bundledProfilesPath && category === "filament") {
         out.push({
           ...base,
           ...(await filamentMetadata(json, bundledProfilesPath)),
+        });
+      } else if (bundledProfilesPath && category === "machine") {
+        out.push({
+          ...base,
+          ...(await printerMetadata(json, bundledProfilesPath)),
         });
       } else {
         out.push(base);
@@ -257,6 +302,109 @@ function firstScalar(value: string | string[] | undefined): string | null {
   }
   if (typeof value === "string" && value.length > 0) return value;
   return null;
+}
+
+type RawPrinterFields = {
+  name?: string;
+  inherits?: string;
+  printable_area?: unknown;
+};
+
+/**
+ * `printable_area` for one bundled machine preset, following `inherits:` when
+ * the leaf does not state it.
+ *
+ * Same walk (`resolveProfile`) and the same degrade contract as
+ * `filamentMetadata` — the machinery is shared on purpose; a second, subtly
+ * different walker is how the leaf-only bug got shipped twice.
+ *
+ * Verified against both bundled trees at the versions the sidecar images
+ * carry, `SoftFever/OrcaSlicer@v2.3.2` and `bambulab/BambuStudio@v02.07.01.57`:
+ * the key is spelled `printable_area` in both, carries the same
+ * `["<x>x<y>", ...]` corner-point shape in both, and resolves for **every**
+ * instantiable `type: "machine"` preset in both (44/44 and 56/56) — but only
+ * through the walk. The two trees genuinely disagree on ~330 setting keys, so
+ * that agreement was measured rather than assumed.
+ *
+ * The listing also contains `type: "machine_model"` catalogue entries
+ * ("Bambu Lab H2D" with no nozzle suffix). Those describe a printer FAMILY,
+ * not a slicing preset, and declare no bed at any point in their chain. They
+ * report `null`, which is the honest answer: there is no bed to report, and
+ * inventing the 0.4-nozzle variant's would be a fabricated value.
+ */
+async function printerMetadata(
+  leaf: RawPrinterFields,
+  bundledProfilesPath: string,
+): Promise<{ printable_area: string[] | null }> {
+  let fields: RawPrinterFields = leaf;
+  const needsWalk =
+    typeof leaf.inherits === "string" &&
+    leaf.inherits.length > 0 &&
+    pointListOf(leaf.printable_area) === null;
+  if (needsWalk) {
+    try {
+      fields = (await resolveProfile({ ...leaf }, "machine", {
+        bundledProfilesPath,
+      })) as RawPrinterFields;
+    } catch (err) {
+      // Same trade as the filament walk: one printer loses its bed rather
+      // than the caller losing the entire Standard tier — but say so. A
+      // systematic resolution failure would otherwise present as every
+      // printer quietly reporting `null`, which is exactly the shape of a
+      // deployment still running an old sidecar, and the two would be
+      // indistinguishable from the outside.
+      console.warn(
+        `[profiles/bundled] inherits walk failed for printer preset "${leaf.name ?? "<unnamed>"}" (inherits="${leaf.inherits}"); falling back to leaf-only metadata: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      fields = leaf;
+    }
+  }
+  return { printable_area: pointListOf(fields.printable_area) };
+}
+
+/**
+ * Normalise a declared bed outline to a list of corner-point strings.
+ *
+ * **Container shape only — never geometry.** Every point the profile declares
+ * survives, in order. What is normalised is the packaging, which the bundled
+ * trees are not consistent about:
+ *
+ *   - Almost every profile writes a JSON array of `"<x>x<y>"` strings.
+ *   - At least one writes the whole polygon as a single comma-joined string
+ *     (`"0x0,400x0,400x400,0x400"` — Creality Ender-5 Max, OrcaSlicer's
+ *     Creality vendor tree). Left alone, that reaches the consumer as an
+ *     un-splittable scalar.
+ *   - At least one has a stray trailing space inside a point
+ *     (`"0x256 "` — `Bambu Lab X2D 0.4 nozzle`, BambuStudio). Left alone, a
+ *     consumer parsing `parseFloat` per axis mostly survives it and a
+ *     consumer doing strict parsing does not.
+ *
+ * Fewer than three usable points is not a polygon, so it degrades to `null`
+ * (with a warning) rather than reaching the consumer as a bed whose bounding
+ * box happens to be zero-sized. `null` must keep meaning "absent", never
+ * "0 × 0".
+ */
+function pointListOf(value: unknown): string[] | null {
+  const raw = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : null;
+  if (raw === null) return null;
+  const points: string[] = [];
+  for (const p of raw) {
+    if (typeof p !== "string") continue;
+    const trimmed = p.trim();
+    if (trimmed.length > 0) points.push(trimmed);
+  }
+  if (points.length === 0) return null;
+  if (points.length < 3) {
+    console.warn(
+      `[profiles/bundled] ignoring printable_area with ${points.length} usable point(s) — a bed outline needs at least 3: ${JSON.stringify(value)}`,
+    );
+    return null;
+  }
+  return points;
 }
 
 // Bundle routes are defined before /:category so the literal "bundle" /
